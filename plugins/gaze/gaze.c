@@ -135,7 +135,6 @@ static void gaze_update(void *data, obs_data_t *settings)
 	const bool unload = obs_data_get_bool(settings, "unload");
 	const bool linear_alpha = obs_data_get_bool(settings, "linear_alpha");
 	const bool is_slide = obs_data_get_bool(settings, "is_slide");
-	const char *server = obs_data_get_string(settings, "server");
 
 	if (context->file)
 		bfree(context->file);
@@ -168,8 +167,7 @@ static void gaze_update(void *data, obs_data_t *settings)
 		return;
 	}
 	char url[256] = {0};
-	error = tobii_enumerate_local_device_urls(context->api, url_receiver,
-						  url);
+	error = tobii_enumerate_local_device_urls(context->api, url_receiver, url);
 	assert(error == TOBII_ERROR_NO_ERROR && *url != '\0');
 
 	if (error != TOBII_ERROR_NO_ERROR) {
@@ -179,8 +177,7 @@ static void gaze_update(void *data, obs_data_t *settings)
 	if (error != TOBII_ERROR_NO_ERROR) {
 		return;
 	}
-	error = tobii_gaze_point_subscribe(context->device, gaze_point_callback,
-					   context);
+	error = tobii_gaze_point_subscribe(context->device, gaze_point_callback, context);
 }
 
 static void gaze_defaults(obs_data_t *settings)
@@ -301,15 +298,11 @@ static void gaze_render(void *data, gs_effect_t *effect)
 
 	gs_matrix_push();
 
-	struct matrix4 mat;
-	struct matrix4 current;
 	gs_matrix_identity();
 
 	float width = obs_source_get_width(context->source);
 	float height = obs_source_get_height(context->source);
-	obs_scene_t *p = obs_scene_from_source(context->source);
-	gs_matrix_translate3f(context->x * width - image->cx / 2.0f,
-			      context->y * height - image->cy / 2.0f, 0);
+	gs_matrix_translate3f(context->x * width - image->cx / 2.0f, context->y * height - image->cy / 2.0f, 0);
 
 	gs_draw_sprite(texture, 0, image->cx, image->cy);
 
@@ -379,8 +372,7 @@ static void gaze_tick(void *data, float seconds)
 
 	const int max_receive = 10;
 	for (int i = 0; i < max_receive; ++i) {
-		tobii_error_t error =
-			tobii_device_process_callbacks(context->device);
+		tobii_error_t error = tobii_device_process_callbacks(context->device);
 
 		if (error != TOBII_ERROR_NO_ERROR) {
 			context->subscribed = false;
@@ -419,8 +411,6 @@ static obs_properties_t *gaze_properties(void *data)
 				obs_module_text("UnloadWhenNotShowing"));
 	obs_properties_add_bool(props, "linear_alpha",
 				obs_module_text("LinearAlpha"));
-	obs_properties_add_text(props, "server", obs_module_text("Server"),
-				OBS_TEXT_DEFAULT);
 
 	return props;
 }
