@@ -34,7 +34,12 @@ struct gaze {
 	volatile bool texture_loaded;
 
 	gs_image_file4_t if4;
+	struct in_addr server_ip;
+	uint16_t server_port;
 	int sock;
+	int tick_since_heartbeat;
+	float x;
+	float y;
 };
 
 static time_t get_modified_timestamp(const char *filename)
@@ -104,6 +109,20 @@ static void gaze_load(struct gaze *context)
 	}
 }
 
+static void gaze_heartbeat(struct gaze *context)
+{
+	struct sockaddr_in serv_addr;
+	serv_addr.sin_addr = context->server_ip;
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_port = htons(context->server_port);
+	//send connect to server, make it realize our addr
+	static char *const connect = "connect\n";
+	int send_res = sendto(context->sock, connect, strlen(connect) + 1, 0,
+			      (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+
+	context->tick_since_heartbeat = 0;
+}
+
 static void gaze_update(void *data, obs_data_t *settings)
 {
 	struct gaze *context = data;
@@ -137,18 +156,15 @@ static void gaze_update(void *data, obs_data_t *settings)
 		return;
 	}
 	context->sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	if (context->sock == -1) {
+		return;
+	}
 
 	char ip[16];
 	int port;
-	sscanf(server, "%15[^:]:%d", ip, &port);
-
-	struct sockaddr_in serv_addr;
-	serv_addr.sin_family = AF_INET;
-	inet_pton(AF_INET, ip, &serv_addr.sin_addr);
-	serv_addr.sin_port = port;
-	int res = connect(context->sock, (struct sockaddr *)&serv_addr,
-			  sizeof(serv_addr));
-	UNUSED_PARAMETER(res);
+	sscanf(server, "%15[^:]:%hd", ip, &context->server_port);
+	inet_pton(AF_INET, ip, &context->server_ip);
+	gaze_heartbeat(context);
 }
 
 static void gaze_defaults(obs_data_t *settings)
@@ -200,7 +216,12 @@ static void *gaze_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct gaze *context = bzalloc(sizeof(struct gaze));
 	context->source = source;
+	context->server_ip.s_addr = 0;
+	context->server_port = 0;
 	context->sock = -1;
+	context->tick_since_heartbeat = 0;
+	context->x = NAN;
+	context->y = NAN;
 
 	gaze_update(context, settings);
 	return context;
@@ -219,14 +240,14 @@ static void gaze_destroy(void *data)
 
 static uint32_t gaze_getwidth(void *data)
 {
-	struct gaze *context = data;
-	return context->if4.image3.image2.image.cx;
+	(void)data;
+	return 2560;
 }
 
 static uint32_t gaze_getheight(void *data)
 {
-	struct gaze *context = data;
-	return context->if4.image3.image2.image.cy;
+	(void)data;
+	return 1600;
 }
 
 static void gaze_render(void *data, gs_effect_t *effect)
@@ -247,18 +268,25 @@ static void gaze_render(void *data, gs_effect_t *effect)
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 
 	gs_eparam_t *const param = gs_effect_get_param_by_name(effect, "image");
+
+	if (isnanf(context->x) || isnanf(context->y)) {
+		return;
+	}
+
 	gs_effect_set_texture_srgb(param, texture);
 
 	gs_matrix_push();
 
 	struct matrix4 mat;
 	struct matrix4 current;
-	gs_matrix_get(&current);
+	gs_matrix_identity();
 
-	int value = context->last_time % 10;
-	matrix4_translate3f(&mat, &current, value, value, 0);
+	float width = obs_source_get_width(context->source);
+	float height = obs_source_get_height(context->source);
+	obs_scene_t *p = obs_scene_from_source(context->source);
+	gs_matrix_translate3f(context->x * width - image->cx / 2.0f,
+			      context->y * height - image->cy / 2.0f, 0);
 
-	gs_matrix_set(&mat);
 	gs_draw_sprite(texture, 0, image->cx, image->cy);
 
 	gs_matrix_pop();
@@ -334,11 +362,41 @@ static void gaze_tick(void *data, float seconds)
 		return;
 	}
 
-	while (true) {
-		struct msghdr msg;
-		if (recvmsg(context->sock, &msg, 0) == -1) {
-			return;
+	const int max_receive = 100;
+	for (int i = 0; i < max_receive; ++i) {
+
+		struct sockaddr_in peer_addr;
+		socklen_t sock_len = sizeof(peer_addr);
+		float xy[2];
+		int recv_size =
+			recvfrom(context->sock, &xy, sizeof(xy), SOCK_NONBLOCK,
+				 (struct sockaddr *)&peer_addr, &sock_len);
+
+		if (recv_size == -1 &&
+		    (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			break;
 		}
+		if (recv_size != sizeof(xy) ||
+		    sock_len != sizeof(struct sockaddr_in)) {
+			continue;
+		}
+		if (peer_addr.sin_addr.s_addr != context->server_ip.s_addr ||
+		    peer_addr.sin_port != htons(context->server_port)) {
+			continue;
+		}
+
+		if (isnanf(context->x) || isnanf(context->y)) {
+			context->x = xy[0];
+			context->y = xy[1];
+		} else {
+			context->x = xy[0] * 0.2 + context->x * 0.8;
+			context->y = xy[1] * 0.2 + context->y * 0.8;
+		}
+	}
+
+	++context->tick_since_heartbeat;
+	if (context->tick_since_heartbeat > max_receive) {
+		gaze_heartbeat(context);
 	}
 }
 
