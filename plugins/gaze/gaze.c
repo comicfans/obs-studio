@@ -3,6 +3,8 @@
 #include <graphics/image-file.h>
 #include <graphics/matrix4.h>
 #include <sys/socket.h>
+#include <tobii/tobii.h>
+#include <tobii/tobii_streams.h>
 #include <util/threading.h>
 #include <util/platform.h>
 #include <util/dstr.h>
@@ -34,10 +36,9 @@ struct gaze {
 	volatile bool texture_loaded;
 
 	gs_image_file4_t if4;
-	struct in_addr server_ip;
-	uint16_t server_port;
-	int sock;
-	int tick_since_heartbeat;
+	tobii_api_t *api;
+	tobii_device_t *device;
+	bool subscribed;
 	float x;
 	float y;
 };
@@ -109,20 +110,24 @@ static void gaze_load(struct gaze *context)
 	}
 }
 
-static void gaze_heartbeat(struct gaze *context)
+static void url_receiver(char const *url, void *user_data)
 {
-	struct sockaddr_in serv_addr;
-	serv_addr.sin_addr = context->server_ip;
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(context->server_port);
-	//send connect to server, make it realize our addr
-	static char *const connect = "connect\n";
-	int send_res = sendto(context->sock, connect, strlen(connect) + 1, 0,
-			      (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+	char *buffer = (char *)user_data;
+	if (*buffer != '\0')
+		return; // only keep first value
 
-	context->tick_since_heartbeat = 0;
+	if (strlen(url) < 256)
+		strcpy(buffer, url);
 }
 
+void gaze_point_callback(tobii_gaze_point_t const *gaze_point, void *user_data)
+{
+	struct gaze *ptr = (struct gaze *)user_data;
+	if (gaze_point->validity == TOBII_VALIDITY_VALID) {
+		ptr->x = gaze_point->position_xy[0];
+		ptr->y = gaze_point->position_xy[1];
+	}
+}
 static void gaze_update(void *data, obs_data_t *settings)
 {
 	struct gaze *context = data;
@@ -148,23 +153,34 @@ static void gaze_update(void *data, obs_data_t *settings)
 	else
 		gaze_unload(data);
 
-	if (context->sock != -1) {
-		close(context->sock);
-	}
-	char *e = strchr(server, ':');
-	if (!e) {
-		return;
-	}
-	context->sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-	if (context->sock == -1) {
-		return;
+	if (context->device) {
+		tobii_device_destroy(context->device);
+		context->device = NULL;
 	}
 
-	char ip[16];
-	int port;
-	sscanf(server, "%15[^:]:%hd", ip, &context->server_port);
-	inet_pton(AF_INET, ip, &context->server_ip);
-	gaze_heartbeat(context);
+	if (context->api) {
+		tobii_api_destroy(context->api);
+		context->api = NULL;
+	}
+
+	tobii_error_t error = tobii_api_create(&context->api, NULL, NULL);
+	if (error != TOBII_ERROR_NO_ERROR) {
+		return;
+	}
+	char url[256] = {0};
+	error = tobii_enumerate_local_device_urls(context->api, url_receiver,
+						  url);
+	assert(error == TOBII_ERROR_NO_ERROR && *url != '\0');
+
+	if (error != TOBII_ERROR_NO_ERROR) {
+		return;
+	}
+	error = tobii_device_create(context->api, url, &context->device);
+	if (error != TOBII_ERROR_NO_ERROR) {
+		return;
+	}
+	error = tobii_gaze_point_subscribe(context->device, gaze_point_callback,
+					   context);
 }
 
 static void gaze_defaults(obs_data_t *settings)
@@ -216,10 +232,9 @@ static void *gaze_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct gaze *context = bzalloc(sizeof(struct gaze));
 	context->source = source;
-	context->server_ip.s_addr = 0;
-	context->server_port = 0;
-	context->sock = -1;
-	context->tick_since_heartbeat = 0;
+	context->api = NULL;
+	context->device = NULL;
+	context->subscribed = false;
 	context->x = NAN;
 	context->y = NAN;
 
@@ -236,6 +251,15 @@ static void gaze_destroy(void *data)
 	if (context->file)
 		bfree(context->file);
 	bfree(context);
+
+	if (context->device) {
+		tobii_device_destroy(context->device);
+		context->device = NULL;
+	}
+	if (context->api) {
+		tobii_api_destroy(context->api);
+		context->api = NULL;
+	}
 }
 
 static uint32_t gaze_getwidth(void *data)
@@ -295,11 +319,6 @@ static void gaze_render(void *data, gs_effect_t *effect)
 	gs_enable_framebuffer_srgb(previous);
 }
 
-struct Pos {
-	float x;
-	float y;
-};
-
 static void gaze_tick(void *data, float seconds)
 {
 	struct gaze *context = data;
@@ -358,45 +377,15 @@ static void gaze_tick(void *data, float seconds)
 
 	context->last_time = frame_time;
 
-	if (context->sock == -1) {
-		return;
-	}
-
-	const int max_receive = 100;
+	const int max_receive = 10;
 	for (int i = 0; i < max_receive; ++i) {
+		tobii_error_t error =
+			tobii_device_process_callbacks(context->device);
 
-		struct sockaddr_in peer_addr;
-		socklen_t sock_len = sizeof(peer_addr);
-		float xy[2];
-		int recv_size =
-			recvfrom(context->sock, &xy, sizeof(xy), SOCK_NONBLOCK,
-				 (struct sockaddr *)&peer_addr, &sock_len);
-
-		if (recv_size == -1 &&
-		    (errno == EAGAIN || errno == EWOULDBLOCK)) {
+		if (error != TOBII_ERROR_NO_ERROR) {
+			context->subscribed = false;
 			break;
 		}
-		if (recv_size != sizeof(xy) ||
-		    sock_len != sizeof(struct sockaddr_in)) {
-			continue;
-		}
-		if (peer_addr.sin_addr.s_addr != context->server_ip.s_addr ||
-		    peer_addr.sin_port != htons(context->server_port)) {
-			continue;
-		}
-
-		if (isnanf(context->x) || isnanf(context->y)) {
-			context->x = xy[0];
-			context->y = xy[1];
-		} else {
-			context->x = xy[0] * 0.2 + context->x * 0.8;
-			context->y = xy[1] * 0.2 + context->y * 0.8;
-		}
-	}
-
-	++context->tick_since_heartbeat;
-	if (context->tick_since_heartbeat > max_receive) {
-		gaze_heartbeat(context);
 	}
 }
 
