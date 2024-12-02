@@ -12,13 +12,14 @@
 #include <netinet/in.h>
 #include <unistd.h>
 
-#define blog(log_level, format, ...)            \
-	blog(log_level, "[gaze: '%s'] " format, \
-	     obs_source_get_name(context->source), ##__VA_ARGS__)
+#define blog(log_level, format, ...) \
+	blog(log_level, "[gaze: '%s'] " format, obs_source_get_name(context->source), ##__VA_ARGS__)
 
 #define debug(format, ...) blog(LOG_DEBUG, format, ##__VA_ARGS__)
 #define info(format, ...) blog(LOG_INFO, format, ##__VA_ARGS__)
 #define warn(format, ...) blog(LOG_WARNING, format, ##__VA_ARGS__)
+
+#define MAX_SAME_COUNT 100
 
 struct gaze {
 	obs_source_t *source;
@@ -41,6 +42,7 @@ struct gaze {
 	bool subscribed;
 	float x;
 	float y;
+	int same_count;
 };
 
 static time_t get_modified_timestamp(const char *filename)
@@ -65,9 +67,7 @@ void gaze_preload_image(void *data)
 
 	context->file_timestamp = get_modified_timestamp(context->file);
 	gs_image_file4_init(&context->if4, context->file,
-			    context->linear_alpha
-				    ? GS_IMAGE_ALPHA_PREMULTIPLY_SRGB
-				    : GS_IMAGE_ALPHA_PREMULTIPLY);
+			    context->linear_alpha ? GS_IMAGE_ALPHA_PREMULTIPLY_SRGB : GS_IMAGE_ALPHA_PREMULTIPLY);
 	os_atomic_set_bool(&context->file_decoded, true);
 }
 
@@ -128,31 +128,15 @@ void gaze_point_callback(tobii_gaze_point_t const *gaze_point, void *user_data)
 		ptr->y = gaze_point->position_xy[1];
 	}
 }
-static void gaze_update(void *data, obs_data_t *settings)
+
+static void init_tobii_if_needed(struct gaze *context)
 {
-	struct gaze *context = data;
-	const char *file = obs_data_get_string(settings, "file");
-	const bool unload = obs_data_get_bool(settings, "unload");
-	const bool linear_alpha = obs_data_get_bool(settings, "linear_alpha");
-	const bool is_slide = obs_data_get_bool(settings, "is_slide");
-
-	if (context->file)
-		bfree(context->file);
-	context->file = bstrdup(file);
-	context->persistent = !unload;
-	context->linear_alpha = linear_alpha;
-	context->is_slide = is_slide;
-
-	if (is_slide)
+	if (context->subscribed) {
 		return;
-
-	/* Load the image if the source is persistent or showing */
-	if (context->persistent || obs_source_showing(context->source))
-		gaze_load(data);
-	else
-		gaze_unload(data);
+	}
 
 	if (context->device) {
+		tobii_device_clear_callback_buffers(context->device);
 		tobii_device_destroy(context->device);
 		context->device = NULL;
 	}
@@ -178,6 +162,38 @@ static void gaze_update(void *data, obs_data_t *settings)
 		return;
 	}
 	error = tobii_gaze_point_subscribe(context->device, gaze_point_callback, context);
+	if (error != TOBII_ERROR_NO_ERROR) {
+		return;
+	}
+	context->subscribed = true;
+	context->x = NAN;
+	context->y = NAN;
+	context->same_count = MAX_SAME_COUNT;
+}
+
+static void gaze_update(void *data, obs_data_t *settings)
+{
+	struct gaze *context = data;
+	const char *file = obs_data_get_string(settings, "file");
+	const bool unload = obs_data_get_bool(settings, "unload");
+	const bool linear_alpha = obs_data_get_bool(settings, "linear_alpha");
+	const bool is_slide = obs_data_get_bool(settings, "is_slide");
+
+	if (context->file)
+		bfree(context->file);
+	context->file = bstrdup(file);
+	context->persistent = !unload;
+	context->linear_alpha = linear_alpha;
+	context->is_slide = is_slide;
+
+	if (is_slide)
+		return;
+
+	/* Load the image if the source is persistent or showing */
+	if (context->persistent || obs_source_showing(context->source))
+		gaze_load(data);
+	else
+		gaze_unload(data);
 }
 
 static void gaze_defaults(obs_data_t *settings)
@@ -234,8 +250,10 @@ static void *gaze_create(obs_data_t *settings, obs_source_t *source)
 	context->subscribed = false;
 	context->x = NAN;
 	context->y = NAN;
+	context->same_count = MAX_SAME_COUNT;
 
 	gaze_update(context, settings);
+	init_tobii_if_needed(context);
 	return context;
 }
 
@@ -250,6 +268,7 @@ static void gaze_destroy(void *data)
 	bfree(context);
 
 	if (context->device) {
+		tobii_device_clear_callback_buffers(context->device);
 		tobii_device_destroy(context->device);
 		context->device = NULL;
 	}
@@ -257,6 +276,7 @@ static void gaze_destroy(void *data)
 		tobii_api_destroy(context->api);
 		context->api = NULL;
 	}
+	context->subscribed = false;
 }
 
 static uint32_t gaze_getwidth(void *data)
@@ -282,6 +302,10 @@ static void gaze_render(void *data, gs_effect_t *effect)
 	if (!texture)
 		return;
 
+	if (isnanf(context->x) || isnanf(context->y) || context->same_count >= MAX_SAME_COUNT) {
+		return;
+	}
+
 	const bool previous = gs_framebuffer_srgb_enabled();
 	gs_enable_framebuffer_srgb(true);
 
@@ -289,10 +313,6 @@ static void gaze_render(void *data, gs_effect_t *effect)
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 
 	gs_eparam_t *const param = gs_effect_get_param_by_name(effect, "image");
-
-	if (isnanf(context->x) || isnanf(context->y)) {
-		return;
-	}
 
 	gs_effect_set_texture_srgb(param, texture);
 
@@ -356,8 +376,7 @@ static void gaze_tick(void *data, float seconds)
 		return;
 	}
 
-	if (context->last_time &&
-	    context->if4.image3.image2.image.is_animated_gif) {
+	if (context->last_time && context->if4.image3.image2.image.is_animated_gif) {
 		uint64_t elapsed = frame_time - context->last_time;
 		bool updated = gs_image_file4_tick(&context->if4, elapsed);
 
@@ -370,14 +389,31 @@ static void gaze_tick(void *data, float seconds)
 
 	context->last_time = frame_time;
 
-	const int max_receive = 10;
-	for (int i = 0; i < max_receive; ++i) {
-		tobii_error_t error = tobii_device_process_callbacks(context->device);
+	init_tobii_if_needed(context);
 
-		if (error != TOBII_ERROR_NO_ERROR) {
-			context->subscribed = false;
-			break;
+	if (!context->subscribed) {
+		return;
+	}
+
+	float pre_x = context->x;
+	float pre_y = context->y;
+
+	tobii_error_t error = tobii_device_process_callbacks(context->device);
+
+	if (error != TOBII_ERROR_NO_ERROR) {
+		context->subscribed = false;
+		context->x = NAN;
+		context->y = NAN;
+		context->same_count = MAX_SAME_COUNT;
+	}
+
+	if (pre_x == context->x && pre_y == context->y) {
+		context->same_count++;
+		if (context->same_count > MAX_SAME_COUNT) {
+			context->same_count = MAX_SAME_COUNT;
 		}
+	} else {
+		context->same_count = 0;
 	}
 }
 
@@ -405,12 +441,10 @@ static obs_properties_t *gaze_properties(void *data)
 
 	obs_properties_t *props = obs_properties_create();
 
-	obs_properties_add_path(props, "file", obs_module_text("File"),
-				OBS_PATH_FILE, image_filter, NULL);
-	obs_properties_add_bool(props, "unload",
-				obs_module_text("UnloadWhenNotShowing"));
-	obs_properties_add_bool(props, "linear_alpha",
-				obs_module_text("LinearAlpha"));
+	obs_properties_add_path(props, "file", obs_module_text("File"), OBS_PATH_FILE, image_filter, NULL);
+	obs_properties_add_bool(props, "unload", obs_module_text("UnloadWhenNotShowing"));
+	obs_properties_add_bool(props, "linear_alpha", obs_module_text("LinearAlpha"));
+	obs_properties_add_text(props, "server", obs_module_text("Server"), OBS_TEXT_DEFAULT);
 
 	return props;
 }
@@ -441,9 +475,8 @@ static obs_missing_files_t *gaze_missingfiles(void *data)
 
 	if (strcmp(s->file, "") != 0) {
 		if (!os_file_exists(s->file)) {
-			obs_missing_file_t *file = obs_missing_file_create(
-				s->file, missing_file_callback,
-				OBS_MISSING_FILE_SOURCE, s->source, NULL);
+			obs_missing_file_t *file = obs_missing_file_create(s->file, missing_file_callback,
+									   OBS_MISSING_FILE_SOURCE, s->source, NULL);
 
 			obs_missing_files_add_file(files, file);
 		}
@@ -452,9 +485,7 @@ static obs_missing_files_t *gaze_missingfiles(void *data)
 	return files;
 }
 
-static enum gs_color_space
-gaze_get_color_space(void *data, size_t count,
-		     const enum gs_color_space *preferred_spaces)
+static enum gs_color_space gaze_get_color_space(void *data, size_t count, const enum gs_color_space *preferred_spaces)
 {
 	UNUSED_PARAMETER(count);
 	UNUSED_PARAMETER(preferred_spaces);
